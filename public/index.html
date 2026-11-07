@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Branch Reviewer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <strong class="logo">Branch Reviewer</strong>
+  <select id="repoSelect" aria-label="Repository"></select>
+  <button data-act="fetch" title="git fetch --all --prune (needs VPN)">Fetch</button>
+  <span class="grow"></span>
+  <button data-act="add-repo">Add repo</button>
+  <button data-act="settings">Settings</button>
+</header>
+
+<div class="layout">
+  <aside class="side">
+    <input id="branchFilter" type="search" placeholder="Filter branches or authors…" aria-label="Filter branches">
+    <label class="chk"><input type="checkbox" id="hideMerged" checked> Hide branches with nothing to review</label>
+    <ul id="branchList" class="branches"></ul>
+  </aside>
+  <main id="main" class="main"><div class="empty">Add a repo, fetch, then pick a branch.</div></main>
+</div>
+
+<dialog id="dlg"><form method="dialog" id="dlgBody"></form></dialog>
+<div id="toast" class="toast" role="status"></div>
+<script src="app.js"></script>
+</body>
+</html>

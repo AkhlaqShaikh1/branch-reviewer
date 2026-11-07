@@ -1,0 +1,12 @@
+{
+  "name": "git-branch-reviewer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local branch review UI with Claude for git servers without pull requests",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=18" }
+}
