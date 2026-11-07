@@ -2,7 +2,7 @@
 const $ = (s, el = document) => el.querySelector(s);
 const enc = encodeURIComponent;
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const inline = s => esc(s).replace(/`([^`\n]+)`/g, '<code>$1</code>');
+const inline = s => esc(s).replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
 const short = sha => (sha || '').slice(0, 8);
 const SEVS = ['blocker', 'major', 'minor', 'nit'];
 const VERDICT = { approve: 'Approved', comment: 'Commented', request_changes: 'Changes requested' };
@@ -214,21 +214,21 @@ function renderHead() {
     <div class="row">
       <span class="title">${esc(S.head)}</span><span class="muted">into</span>
       <select id="baseSelect" aria-label="Base branch">${baseOptions()}</select>
+      <span class="muted">${c ? `${short(c.headSha)} · <span class="add-c">+${add}</span> <span class="del-c">−${del}</span>` : ''}</span>
       <label class="chk"><input type="checkbox" id="wsToggle" ${S.ws ? 'checked' : ''}> Hide whitespace</label>
       <span class="grow"></span>
       <div class="seg">${Object.keys(VERDICT_BTN).map(v => `<button data-act="verdict" data-v="${v}" class="v-${v} ${S.review.verdict === v ? 'on' : ''}">${VERDICT_BTN[v]}</button>`).join('')}</div>
-      <button data-act="export" ${c ? '' : 'disabled'}>Export review</button>
+      <button data-act="export" ${c ? '' : 'disabled'}>Export</button>
     </div>
     <div class="row">
-      <span class="muted">${c ? `${c.commits.length} commits · ${files.length} files · <span class="add-c">+${add}</span> <span class="del-c">−${del}</span> · head ${short(c.headSha)}` : ''}</span>
+      <div class="tabs">
+        ${tab('overview', `Overview${pend ? ` (${pend} pending)` : ''}`)}
+        ${tab('files', `Files (${files.length})`)}
+        ${tab('commits', `Commits (${c?.commits.length ?? 0})`)}
+      </div>
       <span class="grow"></span>
-      <input type="text" id="focusInput" placeholder="Focus for Claude (optional), e.g. SQL safety" value="${esc(S.focus)}" size="36">
-      <button class="primary" data-act="run-ai" ${running || !c?.files.length ? 'disabled' : ''}>${S.ai ? 'Re-run Claude review' : 'Review with Claude'}</button>
-    </div>
-    <div class="tabs">
-      ${tab('overview', `Overview${pend ? ` (${pend} pending)` : ''}`)}
-      ${tab('files', `Files (${files.length})`)}
-      ${tab('commits', `Commits (${c?.commits.length ?? 0})`)}
+      <input type="text" id="focusInput" placeholder="Focus for Claude (optional)" value="${esc(S.focus)}" size="28">
+      <button class="primary" data-act="run-ai" ${running || !c?.files.length ? 'disabled' : ''}>${S.ai ? 'Re-run Claude' : 'Review with Claude'}</button>
     </div>
   </div>`;
 }
@@ -365,7 +365,7 @@ function renderFile(f, i, items) {
     ${!collapsed && (fileLevel.length || fileDraft) ? `<div class="filelevel">${fileLevel.map(it => renderCard(it, null)).join('')}${fileDraft ? renderDraft() : ''}</div>` : ''}
     ${f.binary ? '<div class="filelevel muted">Binary file</div>' : ''}
     ${collapsed && big && !isViewed(f) ? `<div class="filelevel muted">Large diff (${f.add + f.del} lines) hidden. Click the file name to show it.</div>` : ''}
-    ${rows ? `<table class="diff">${rows}</table>` : ''}
+    ${rows ? `<table class="diff"><colgroup><col class="cno"><col class="cno"><col></colgroup>${rows}</table>` : ''}
   </section>`;
 }
 
@@ -575,6 +575,7 @@ const actions = {
     const c = fromFinding(S.ai.findings.find(f => f.id === el.dataset.id));
     S.review.comments.push(c);
     S.draft = { mode: 'edit', id: c.id, text: c.body, severity: c.severity, focus: true };
+    if (S.cmp.files.some(f => f.path === c.file)) S.tab = 'files'; // Overview doesn't render kept comments, so edit where it lives
     save();
     render();
   },
