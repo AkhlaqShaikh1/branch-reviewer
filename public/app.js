@@ -2,9 +2,17 @@
 const $ = (s, el = document) => el.querySelector(s);
 const enc = encodeURIComponent;
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const inline = s => esc(s).replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+const inlineText = s => esc(s).replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+// Claude's text: ```fenced``` blocks become <pre>, the rest gets `code` and **bold**.
+const inline = s => String(s ?? '').split(/```[\w+-]*\n?([\s\S]*?)(?:```|$)/).map((part, k, all) => k % 2 ? `<pre>${esc(part.replace(/\n$/, ''))}</pre>`
+  : inlineText((k ? part.replace(/^\n+/, '') : part).replace(k < all.length - 1 ? /\n+$/ : /$^/, ''))).join('');
 const short = sha => (sha || '').slice(0, 8);
 const SEVS = ['blocker', 'major', 'minor', 'nit'];
+const svg = d => `<svg aria-hidden="true" viewBox="0 0 24 24">${d}</svg>`;
+const ICON = {
+  sparkle: svg('<path d="M9.94 15.5A2 2 0 0 0 8.5 14.06l-6.14-1.58a.5.5 0 0 1 0-.96L8.5 9.94A2 2 0 0 0 9.94 8.5l1.58-6.14a.5.5 0 0 1 .96 0L14.06 8.5A2 2 0 0 0 15.5 9.94l6.14 1.58a.5.5 0 0 1 0 .96L15.5 14.06a2 2 0 0 0-1.44 1.44l-1.58 6.14a.5.5 0 0 1-.96 0z"/>'),
+  download: svg('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/>'),
+};
 const VERDICT = { approve: 'Approved', comment: 'Commented', request_changes: 'Changes requested' };
 const VERDICT_BTN = { approve: 'Approve', comment: 'Comment', request_changes: 'Request changes' };
 const store = {
@@ -40,6 +48,7 @@ const S = {
   config: { repos: [], settings: {} }, repo: null, branches: [], defaultBase: null,
   head: null, base: null, cmp: null, cmpError: null, review: null, ai: null, job: null,
   tab: 'files', ws: false, collapsed: new Set(), draft: null, focus: '',
+  split: store.get('split') === '1', fileCache: {},
 };
 
 let pending = null, saveT;
@@ -136,8 +145,8 @@ function renderBranches() {
       ? '<span class="badge b-new">new commits</span>'
       : `<span class="badge b-${st.verdict}">${VERDICT[st.verdict]}</span>`;
     return `<li data-act="branch" data-name="${esc(b.name)}" class="${b.name === S.head ? 'sel' : ''}">
-      <div class="bn">${esc(b.name)} ${badge}</div>
-      <div class="bm">${esc(b.author)} · ${ago(b.date)}${b.ahead != null ? ` · ${b.ahead} ahead, ${b.behind} behind` : ''}</div>
+      <div class="bn">${esc(b.name)}</div>
+      <div class="bm">${badge ? `${badge} · ` : ''}${esc(b.author)} · ${ago(b.date)}${b.ahead != null ? ` · ${b.ahead} ahead, ${b.behind} behind` : ''}</div>
       <div class="bm">${esc(b.subject)}</div></li>`;
   }).join('') || '<li class="muted">No branches. Try Fetch (VPN on?)</li>';
 }
@@ -215,10 +224,9 @@ function renderHead() {
       <span class="title">${esc(S.head)}</span><span class="muted">into</span>
       <select id="baseSelect" aria-label="Base branch">${baseOptions()}</select>
       <span class="muted">${c ? `${short(c.headSha)} · <span class="add-c">+${add}</span> <span class="del-c">−${del}</span>` : ''}</span>
-      <label class="chk"><input type="checkbox" id="wsToggle" ${S.ws ? 'checked' : ''}> Hide whitespace</label>
       <span class="grow"></span>
       <div class="seg">${Object.keys(VERDICT_BTN).map(v => `<button data-act="verdict" data-v="${v}" class="v-${v} ${S.review.verdict === v ? 'on' : ''}">${VERDICT_BTN[v]}</button>`).join('')}</div>
-      <button data-act="export" ${c ? '' : 'disabled'}>Export</button>
+      <button data-act="export" ${c ? '' : 'disabled'}>${ICON.download}Export</button>
     </div>
     <div class="row">
       <div class="tabs">
@@ -227,8 +235,10 @@ function renderHead() {
         ${tab('commits', `Commits (${c?.commits.length ?? 0})`)}
       </div>
       <span class="grow"></span>
+      <label class="chk"><input type="checkbox" id="splitToggle" ${S.split ? 'checked' : ''}> Side by side</label>
+      <label class="chk"><input type="checkbox" id="wsToggle" ${S.ws ? 'checked' : ''}> Hide whitespace</label>
       <input type="text" id="focusInput" placeholder="Focus for Claude (optional)" value="${esc(S.focus)}" size="28">
-      <button class="primary" data-act="run-ai" ${running || !c?.files.length ? 'disabled' : ''}>${S.ai ? 'Re-run Claude' : 'Review with Claude'}</button>
+      <button class="primary" data-act="run-ai" ${running || !c?.files.length ? 'disabled' : ''}>${ICON.sparkle}${S.ai ? 'Re-run Claude' : 'Review with Claude'}</button>
     </div>
   </div>`;
 }
@@ -276,10 +286,23 @@ function renderCard(it, lineText, showFile) {
 
 function renderDraft() {
   const d = S.draft;
-  return `<div class="draft"><textarea id="draftText" placeholder="Explain the problem and how to fix it…">${esc(d.text || '')}</textarea>
+  const ask = d.mode === 'new'
+    ? `<button type="button" data-act="ask-claude" ${d.asking ? 'disabled' : ''}>${ICON.sparkle}${d.asking ? 'Asking Claude…' : 'Ask Claude'}</button>` : '';
+  const answer = d.answer ? `<div class="answer"><div class="label">Claude</div><div class="card-b">${inline(d.answer)}</div>
+    <div class="row"><button type="button" data-act="use-answer">Use as comment</button><button type="button" class="link" data-act="drop-answer">Discard</button></div></div>` : '';
+  return `<div class="draft"><textarea id="draftText" placeholder="${d.mode === 'new' ? 'Write a comment, or type a question and click Ask Claude' : 'Edit comment'}">${esc(d.text || '')}</textarea>
+    ${answer}
     <div class="row"><select id="draftSev" aria-label="Severity">${SEVS.map(s => `<option ${s === (d.severity || 'minor') ? 'selected' : ''}>${s}</option>`).join('')}</select>
-    <button type="button" class="primary" data-act="save-draft">Save comment</button><button type="button" data-act="cancel-draft">Cancel</button>
+    <button type="button" class="primary" data-act="save-draft">Save comment</button>${ask}<button type="button" data-act="cancel-draft">Cancel</button>
     <span class="muted">Ctrl+Enter saves, Esc cancels</span></div></div>`;
+}
+
+// The hunk around the line (or the first hunks for a file comment), in the same numbered format Claude reviews with.
+function askContext(d) {
+  const f = S.cmp.files.find(x => x.path === d.file);
+  const fmt = h => h.lines.map(([t, , n, s]) => `${n == null ? '     ' : String(n).padStart(5)} ${t}${s}`).join('\n');
+  if (d.line == null) return f.hunks.slice(0, 3).map(fmt).join('\n...\n');
+  return fmt(f.hunks.find(h => h.lines.some(l => (d.side === 'old' ? l[1] : l[2]) === d.line)) || f.hunks[0]);
 }
 
 function renderOverview() {
@@ -320,11 +343,32 @@ function renderFiles() {
   const nav = S.cmp.files.map((f, i) => {
     const n = (byFile[f.path] || []).length;
     const name = f.path.split('/').pop();
-    return `<a href="#f${i}" class="${isViewed(f) ? 'viewed' : ''}" title="${esc(f.path)}"><span class="st">${f.status[0]}</span><span class="fn">${esc(name)}</span>${n ? `<span class="cnt">${n}</span>` : ''}</a>`;
+    return `<a href="#f${i}" class="${isViewed(f) ? 'viewed' : ''}" title="${esc(f.path)}"><span class="st st-${f.status}">${f.status[0]}</span><span class="fn">${esc(name)}</span>${n ? `<span class="cnt">${n}</span>` : ''}</a>`;
   }).join('');
   const viewed = S.cmp.files.filter(isViewed).length;
   return `<div class="files-wrap"><nav class="filenav"><div class="muted">${viewed}/${S.cmp.files.length} viewed</div>${nav}</nav>
     <div>${S.cmp.files.map((f, i) => renderFile(f, i, byFile[f.path] || [])).join('')}</div></div>`;
+}
+
+const lastNo = (h, col) => { for (let j = h.lines.length - 1; j >= 0; j--) if (h.lines[j][col] != null) return h.lines[j][col]; return (col === 1 ? h.oldStart : h.newStart) - 1; };
+
+// Pull unchanged lines from the file into the diff: the gap above hunk k, or the rest of the file ('end').
+function expandGap(f, gap, lines) {
+  if (gap === 'end') {
+    const h = f.hunks.at(-1);
+    let o = lastNo(h, 1), n = lastNo(h, 2);
+    while (n < lines.length) h.lines.push([' ', ++o, ++n, lines[n - 1]]);
+    f.endLoaded = true;
+    return;
+  }
+  const k = +gap, h = f.hunks[k], prev = f.hunks[k - 1];
+  const from = prev ? lastNo(prev, 2) + 1 : 1;
+  const ctx = [];
+  for (let n = from; n < h.newStart; n++) ctx.push([' ', n + h.oldStart - h.newStart, n, lines[n - 1] ?? '']);
+  h.lines.unshift(...ctx);
+  h.oldStart -= ctx.length;
+  h.newStart = from;
+  if (prev) { prev.lines.push(...h.lines); f.hunks.splice(k, 1); }
 }
 
 function renderFile(f, i, items) {
@@ -334,38 +378,78 @@ function renderFile(f, i, items) {
   for (const h of f.hunks) for (const l of h.lines) rowKeys.add(l[0] === '-' ? `old|${l[1]}` : `new|${l[2]}`);
   const collapsed = S.collapsed.has(f.path);
   const d = S.draft;
+  const fam = HL.family(f.path);
+  const cols = S.split ? 4 : 3;
+  const canExpand = f.status !== 'added' && f.status !== 'deleted' && !f.binary;
+  const expandBtn = (gap, label) => `<button type="button" class="link" data-act="expand" data-file="${i}" data-gap="${gap}">${label}</button>`;
+
+  // Comments and the open draft that belong under a row, for each [side, line, lineText] the row shows.
+  const thread = keys => {
+    let h = '';
+    for (const [side, line, text] of keys) {
+      h += (byKey[`${side}|${line}`] || []).map(it => renderCard(it, text)).join('');
+      if (d?.mode === 'new' && d.file === f.path && d.side === side && d.line === line) h += renderDraft();
+    }
+    return h ? `<tr class="thread"><td colspan="${cols}">${h}</td></tr>` : '';
+  };
+  const no = (side, line, cls = '') => `<td class="no ${cls}" data-act="add" data-side="${side}" data-line="${line}">${line}</td>`;
+  const kind = t => t === '+' ? 'add' : t === '-' ? 'del' : '';
 
   let rows = '';
   if (!collapsed) {
-    for (const h of f.hunks) {
-      rows += `<tr class="hunk"><td colspan="3">${esc(h.header)}</td></tr>`;
-      for (const [t, o, n, s] of h.lines) {
-        const side = t === '-' ? 'old' : 'new';
-        const line = t === '-' ? o : n;
-        rows += `<tr class="ln ${t === '+' ? 'add' : t === '-' ? 'del' : ''}" data-file="${i}" data-side="${side}" data-line="${line}">
-          <td class="no" data-act="add">${o ?? ''}</td><td class="no" data-act="add">${n ?? ''}</td><td class="code">${t}${esc(s)}</td></tr>`;
-        const here = byKey[`${side}|${line}`];
-        const draftHere = d?.mode === 'new' && d.file === f.path && d.side === side && d.line === line;
-        if (here || draftHere) rows += `<tr class="thread"><td colspan="3">${(here || []).map(it => renderCard(it, s)).join('')}${draftHere ? renderDraft() : ''}</td></tr>`;
+    f.hunks.forEach((h, k) => {
+      const hidden = h.newStart - (k ? lastNo(f.hunks[k - 1], 2) : 0) - 1;
+      rows += `<tr class="hunk"><td colspan="${cols}">${canExpand && hidden > 0 ? expandBtn(k, `Show ${hidden} line${hidden > 1 ? 's' : ''}`) : ''}<span>${esc(h.header)}</span></td></tr>`;
+      if (!S.split) {
+        for (const [t, o, n, s] of h.lines) {
+          const side = t === '-' ? 'old' : 'new', line = t === '-' ? o : n;
+          rows += `<tr class="ln ${kind(t)}" data-file="${i}">
+            <td class="no" data-act="add" data-side="${side}" data-line="${line}">${o ?? ''}</td><td class="no" data-act="add" data-side="${side}" data-line="${line}">${n ?? ''}</td>
+            <td class="code"><span class="mk">${t}</span>${HL.highlight(s, fam)}</td></tr>` + thread([[side, line, s]]);
+        }
+        return;
       }
-    }
+      // Split view: pair each run of removed lines with the run of added lines after it.
+      const L = h.lines;
+      let j = 0;
+      const pair = (l, r) => {
+        const left = !l ? '<td class="no blank"></td><td class="code blank"></td>'
+          : l[0] === '-' ? no('old', l[1], 'del') + `<td class="code del">${HL.highlight(l[3], fam)}</td>`
+          : no('new', l[2]) + `<td class="code">${HL.highlight(l[3], fam)}</td>`;
+        const right = !r ? '<td class="no blank"></td><td class="code blank"></td>'
+          : no('new', r[2], kind(r[0])) + `<td class="code ${kind(r[0])}">${HL.highlight(r[3], fam)}</td>`;
+        const keys = [];
+        if (l?.[0] === '-') keys.push(['old', l[1], l[3]]);
+        if (r) keys.push(['new', r[2], r[3]]);
+        rows += `<tr class="ln sp" data-file="${i}">${left}${right}</tr>` + thread(keys);
+      };
+      while (j < L.length) {
+        if (L[j][0] === ' ') { pair(L[j], L[j]); j++; continue; }
+        const dels = [], adds = [];
+        while (j < L.length && L[j][0] === '-') dels.push(L[j++]);
+        while (j < L.length && L[j][0] === '+') adds.push(L[j++]);
+        for (let m = 0; m < Math.max(dels.length, adds.length); m++) pair(dels[m], adds[m]);
+      }
+    });
+    if (canExpand && f.hunks.length && !f.endLoaded) rows += `<tr class="hunk"><td colspan="${cols}">${expandBtn('end', 'Show rest of file')}</td></tr>`;
   }
   const fileLevel = items.filter(it => it.line == null || !rowKeys.has(`${it.side || 'new'}|${it.line}`));
   const fileDraft = d?.mode === 'new' && d.file === f.path && d.line == null;
   const big = f.add + f.del > 1500;
+  const colgroup = S.split ? '<col class="cno"><col><col class="cno"><col>' : '<col class="cno"><col class="cno"><col>';
 
   return `<section class="file" id="f${i}">
-    <div class="fh"><span class="st">${f.status}</span>
+    <div class="fh"><span class="st st-${f.status}">${f.status}</span>
       <span class="path" data-act="toggle-file" data-file="${i}">${collapsed ? '▸' : '▾'} ${f.status === 'renamed' ? esc(f.oldPath) + ' → ' : ''}${esc(f.path)}</span>
       <span class="add-c">+${f.add}</span><span class="del-c">−${f.del}</span>
-      ${items.length ? `<span class="cnt">${items.length} comments</span>` : ''}
+      ${items.length ? `<span class="cnt">${items.length} comment${items.length > 1 ? 's' : ''}</span>` : ''}
       <button class="link" data-act="file-comment" data-file="${i}">Comment on file</button>
       <label class="chk"><input type="checkbox" data-act="viewed" data-file="${i}" ${isViewed(f) ? 'checked' : ''}> Viewed</label>
     </div>
     ${!collapsed && (fileLevel.length || fileDraft) ? `<div class="filelevel">${fileLevel.map(it => renderCard(it, null)).join('')}${fileDraft ? renderDraft() : ''}</div>` : ''}
     ${f.binary ? '<div class="filelevel muted">Binary file</div>' : ''}
     ${collapsed && big && !isViewed(f) ? `<div class="filelevel muted">Large diff (${f.add + f.del} lines) hidden. Click the file name to show it.</div>` : ''}
-    ${rows ? `<table class="diff"><colgroup><col class="cno"><col class="cno"><col></colgroup>${rows}</table>` : ''}
+    ${rows ? `<table class="diff ${S.split ? 'split' : ''}"><colgroup>${colgroup}</colgroup>${rows}</table>` : ''}
   </section>`;
 }
 
@@ -508,6 +592,11 @@ function openSettings() {
 const findDraftFile = i => S.cmp.files[+i];
 const actions = {
   'branch': el => selectBranch(el.dataset.name),
+  'theme'() {
+    const t = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+    document.documentElement.dataset.theme = t;
+    store.set('theme', t);
+  },
   'tab': el => { S.tab = el.dataset.tab; render(); },
   'add-repo': openAddRepo,
   'settings': openSettings,
@@ -515,7 +604,7 @@ const actions = {
   async 'fetch'(el) {
     if (!S.repo) return;
     el.disabled = true;
-    el.textContent = 'Fetching…';
+    el.lastElementChild.textContent = 'Fetching…';
     try {
       await api('POST', `/api/fetch?repo=${S.repo}`);
       toast('Fetched');
@@ -523,17 +612,45 @@ const actions = {
       if (S.head) await loadCompare();
     } catch (e) { toast('Fetch failed (VPN?): ' + e.message); }
     el.disabled = false;
-    el.textContent = 'Fetch';
+    el.lastElementChild.textContent = 'Fetch';
   },
 
   'add'(el) {
-    const tr = el.closest('tr.ln');
-    const f = findDraftFile(tr.dataset.file);
+    const f = findDraftFile(el.closest('[data-file]').dataset.file);
+    const side = el.dataset.side, line = +el.dataset.line;
     captureDraft();
     if (S.draft?.text?.trim() && !confirm('Discard the comment you are writing?')) return;
-    S.draft = { mode: 'new', file: f.path, side: tr.dataset.side, line: +tr.dataset.line, lineText: tr.querySelector('.code').textContent.slice(1), text: '', severity: 'minor', focus: true };
+    S.draft = { mode: 'new', file: f.path, side, line, lineText: lineTextFor(f.path, side, line), text: '', severity: 'minor', focus: true };
     render();
   },
+  async 'expand'(el) {
+    const f = findDraftFile(el.dataset.file);
+    const key = `${S.cmp.headSha}:${f.path}`;
+    el.disabled = true;
+    S.fileCache[key] ??= (await api('GET', `/api/file?repo=${S.repo}&sha=${S.cmp.headSha}&path=${enc(f.path)}`)).lines;
+    expandGap(f, el.dataset.gap, S.fileCache[key]);
+    render();
+  },
+  async 'ask-claude'() {
+    captureDraft();
+    const d = S.draft;
+    if (!d.text.trim()) return toast('Type your question in the box first');
+    d.asking = true;
+    render();
+    try {
+      const r = await api('POST', `/api/ask?repo=${S.repo}`, { head: S.head, file: d.file, line: d.line, question: d.text, context: askContext(d) });
+      d.answer = r.answer;
+    } catch (e) { toast(e.message); }
+    d.asking = false;
+    if (S.draft === d) render();
+  },
+  'use-answer'() {
+    $('#draftText').value = S.draft.answer; // render() reads the textarea back into the draft
+    S.draft.answer = null;
+    S.draft.focus = true;
+    render();
+  },
+  'drop-answer'() { S.draft.answer = null; render(); },
   'file-comment'(el) {
     const f = findDraftFile(el.dataset.file);
     S.collapsed.delete(f.path);
@@ -717,6 +834,7 @@ document.addEventListener('change', e => {
     if (t.value !== S.review.reviewedSha) { S.review.base = t.value; save(); }
     loadCompare();
   } else if (t.id === 'wsToggle') { S.ws = t.checked; loadCompare(); }
+  else if (t.id === 'splitToggle') { S.split = t.checked; store.set('split', t.checked ? '1' : '0'); render(); }
   else if (t.dataset.act === 'viewed') {
     const f = findDraftFile(t.dataset.file);
     if (t.checked) { S.review.viewed[f.path] = f.sig; S.collapsed.add(f.path); }

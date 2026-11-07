@@ -19,7 +19,7 @@ function parseDiff(text) {
       if (!m) continue;
       oldNo = +m[1];
       newNo = +m[2];
-      h = { header: line, lines: [] };
+      h = { header: line, oldStart: oldNo, newStart: newNo, lines: [] };
       f.hunks.push(h);
       continue;
     }

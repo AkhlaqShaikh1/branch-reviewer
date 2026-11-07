@@ -152,6 +152,52 @@ async function prepareWorktree(repo, sha) {
   return wt;
 }
 
+// One review worktree per repo, so Claude runs take turns on it.
+const wtLocks = new Map();
+function withWorktree(repo, sha, fn) {
+  const run = (wtLocks.get(repo.id) || Promise.resolve()).then(async () => fn(await prepareWorktree(repo, sha)));
+  wtLocks.set(repo.id, run.catch(() => {}));
+  return run;
+}
+
+function modelArgs(repo) {
+  const m = repo.model || loadConfig().settings?.model;
+  return m ? ['--model', m] : [];
+}
+
+// Runs `claude -p` with read-only tools in cwd. Resolves with the final result message.
+function runClaude({ cwd, prompt, extraArgs = [], onTool, onSpawn, timeoutMs = AI_TIMEOUT_MS }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(CLAUDE_BIN, ['-p', '--output-format', 'stream-json', '--verbose', '--tools', 'Read,Grep,Glob', ...extraArgs], { cwd, windowsHide: true });
+    onSpawn?.(child);
+    const timer = setTimeout(() => { child.kill(); reject(new Error('Claude timed out')); }, timeoutMs);
+    let buf = '', stderr = '', final = null;
+    child.stdout.on('data', d => {
+      buf += d;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        let msg; try { msg = JSON.parse(line); } catch { continue; }
+        if (msg.type === 'assistant') {
+          for (const c of msg.message?.content || []) {
+            if (c.type !== 'tool_use' || c.name === 'StructuredOutput') continue;
+            const target = String(c.input?.file_path || c.input?.pattern || c.input?.path || '');
+            onTool?.(`${c.name} ${target.replace(cwd, '').replace(/^[\\/]/, '')}`);
+          }
+        } else if (msg.type === 'result') final = msg;
+      }
+    });
+    child.stderr.on('data', d => { stderr = (stderr + d).slice(-4000); });
+    child.on('error', e => { clearTimeout(timer); reject(new Error(`Cannot start "${CLAUDE_BIN}": ${e.message}`)); });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (final && !final.is_error) return resolve(final);
+      reject(new Error(final?.result || stderr.trim() || `Claude exited with code ${code}`));
+    });
+    child.stdin.end(prompt);
+  });
+}
+
 async function startAiReview(repo, { base, head, focus }) {
   const running = [...jobs.values()].find(j => j.repoId === repo.id && j.status === 'running');
   if (running) throw httpError(409, `A Claude review is already running for ${running.head} in this repo`);
@@ -167,55 +213,25 @@ async function startAiReview(repo, { base, head, focus }) {
     const files = parseDiff(await git(repo.path, ['diff', '--no-color', '--no-ext-diff', '-M', '-U5', mergeBase, headSha]));
     if (!files.length) throw new Error('No changes between base and branch');
     const commits = await getCommits(repo, mergeBase, headSha);
-    log(`Checking out ${headSha.slice(0, 8)} into review worktree…`);
-    const wt = await prepareWorktree(repo, headSha);
     const settings = loadConfig().settings || {};
     const guidelines = [settings.guidelines, repo.guidelines].filter(Boolean).join('\n');
     const prompt = buildPrompt({ head, base, commits, files, guidelines, focus });
-    const model = repo.model || settings.model;
-    log(`Starting Claude${model ? ` (${model})` : ''} on ${files.length} files…`);
-
-    const args = ['-p', '--output-format', 'stream-json', '--verbose', '--tools', 'Read,Grep,Glob', '--json-schema', JSON.stringify(SCHEMA)];
-    if (model) args.push('--model', model);
-    const result = await new Promise((resolve, reject) => {
-      const child = spawn(CLAUDE_BIN, args, { cwd: wt, windowsHide: true });
-      job.kill = () => child.kill();
-      const timer = setTimeout(() => { child.kill(); reject(new Error('Claude review timed out')); }, AI_TIMEOUT_MS);
-      let buf = '', stderr = '', final = null;
-      child.stdout.on('data', d => {
-        buf += d;
-        let i;
-        while ((i = buf.indexOf('\n')) >= 0) {
-          const line = buf.slice(0, i); buf = buf.slice(i + 1);
-          let msg; try { msg = JSON.parse(line); } catch { continue; }
-          if (msg.type === 'assistant') {
-            for (const c of msg.message?.content || []) {
-              if (c.type !== 'tool_use' || c.name === 'StructuredOutput') continue;
-              const target = c.input?.file_path || c.input?.pattern || c.input?.path || '';
-              log(`${c.name} ${String(target).replace(wt, '').replace(/^[\\/]/, '')}`);
-            }
-          } else if (msg.type === 'result') final = msg;
-        }
-      });
-      child.stderr.on('data', d => { stderr = (stderr + d).slice(-4000); });
-      child.on('error', e => { clearTimeout(timer); reject(new Error(`Cannot start "${CLAUDE_BIN}": ${e.message}`)); });
-      child.on('close', code => {
-        clearTimeout(timer);
-        if (job.status === 'cancelled') return reject(new Error('Cancelled'));
-        if (final && !final.is_error && final.structured_output) return resolve(final);
-        reject(new Error(final?.result || stderr.trim() || `Claude exited with code ${code}`));
-      });
-      child.stdin.end(prompt);
+    const extraArgs = ['--json-schema', JSON.stringify(SCHEMA), ...modelArgs(repo)];
+    log(`Checking out ${headSha.slice(0, 8)} into review worktree…`);
+    const result = await withWorktree(repo, headSha, wt => {
+      if (job.status === 'cancelled') throw new Error('Cancelled');
+      log(`Starting Claude${extraArgs.includes('--model') ? ` (${extraArgs.at(-1)})` : ''} on ${files.length} files…`);
+      return runClaude({ cwd: wt, prompt, extraArgs, onTool: log, onSpawn: c => { job.kill = () => c.kill(); } });
     });
-
     const out = result.structured_output;
+    if (!out) throw new Error(result.result || 'Claude returned no structured review');
     const findings = (out.findings || []).map(f => ({
       ...f,
       file: String(f.file).replace(/^\.?[\\/]/, '').replace(/^[ab]\//, '').replace(/\\/g, '/'),
       id: hash(`${f.file}|${f.line}|${f.title}|${headSha}`, 12),
     }));
     await writeJson(reviewFiles(repo, head).ai, {
-      ranAt: new Date().toISOString(), base, head, headSha, mergeBase, model: model || null,
+      ranAt: new Date().toISOString(), base, head, headSha, mergeBase, model: modelArgs(repo)[1] || null,
       durationMs: result.duration_ms, focus: focus || '',
       summary: out.summary, verdict: out.verdict, praise: out.praise || [], findings,
     });
@@ -404,6 +420,39 @@ const routes = {
   'POST /api/ai-review': async (q, body) => {
     const repo = getRepo(q.get('repo'));
     return publicJob(await startAiReview(repo, { base: body.base, head: body.head, focus: String(body.focus || '').slice(0, 2000) }));
+  },
+
+  // File content at a commit, for expanding diff context.
+  'GET /api/file': async q => {
+    const repo = getRepo(q.get('repo'));
+    const sha = await resolveRef(repo, q.get('sha'));
+    const p = q.get('path') || '';
+    if (!p || p.startsWith('-')) throw httpError(400, 'Bad path');
+    let text;
+    try { text = await git(repo.path, ['show', `${sha}:${p}`]); }
+    catch { throw httpError(404, `${p} not found at ${sha.slice(0, 8)}`); }
+    const lines = text.split('\n').map(l => l.replace(/\r$/, ''));
+    if (lines.at(-1) === '') lines.pop();
+    return { lines };
+  },
+
+  // Ask Claude a question about one line or file of the branch.
+  'POST /api/ask': async (q, body) => {
+    const repo = getRepo(q.get('repo'));
+    const headSha = await resolveRef(repo, body.head);
+    const question = String(body.question || '').trim().slice(0, 4000);
+    if (!question) throw httpError(400, 'Type a question first');
+    const prompt = `You are helping a senior engineer review a junior developer's branch "${body.head}". Your current directory is the repository at the branch head. Use Read, Grep and Glob to check surrounding code when it helps.
+
+File: ${String(body.file || '')}${body.line ? `, line ${+body.line} (new-file numbering)` : ''}
+Diff context (left column = new-file line number):
+${String(body.context || '').slice(0, 20000)}
+
+Question: ${question}
+
+Answer in under 200 words, specific to this code. If you suggest a change, show the code. Do not restate the question.`;
+    const result = await withWorktree(repo, headSha, wt => runClaude({ cwd: wt, prompt, extraArgs: modelArgs(repo), timeoutMs: 5 * 60 * 1000 }));
+    return { answer: String(result.result || '').trim() };
   },
 
   'GET /api/job': async q => {
